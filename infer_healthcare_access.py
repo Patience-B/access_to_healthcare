@@ -8,7 +8,11 @@ import logging
 from typing import Tuple, List
 from abc import ABC, abstractmethod
 from shapely.geometry import Point, LineString, Polygon
-
+import dask
+from dask.distributed import Client, as_completed
+from dask import delayed
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed as futures_completed
 
 from src.utils.s3_utils import check_s3_file_exists, save_to_s3_bucket, save_csv_to_s3_bucket
 from src.utils.db_utils import db_to_df, connect_to_aws_db 
@@ -253,14 +257,114 @@ def get_isochrone_polygons_for_facility(
     return gdf
 
 
-def generate_isochrones(iso_code: str, transport_mode: str = "driving", tier_filter: str = "Tier4 central hospital"):
+@delayed
+def process_single_facility(facility_data, isochrone_generator, country_path, save_folder):
     """
-    Main function to generate isochrones for all facilities in a country.
+    Delayed function to process a single facility for Dask parallelization.
+    
+    Args:
+        facility_data: Dictionary containing facility information
+        isochrone_generator: Isochrone generator instance
+        country_path: Path to country directory
+        save_folder: Folder for saving isochrones
+    
+    Returns:
+        tuple: (facility_id, success_status, error_message)
+    """
+    try:
+        facility_coords = (facility_data['latitude'], facility_data['longitude'])
+        facility_id = facility_data['id']
+        tier_name = facility_data['tier_name']
+        
+        print(f"Processing facility {facility_id} ({tier_name}): {facility_coords}")
+        
+        # Generate isochrones using the updated save path and folder structure
+        result = get_isochrone_polygons_for_facility(
+            facility_coords=facility_coords,
+            tier_name=tier_name,
+            facility_id=facility_id,
+            trip_times=isochrone_generator.ranges,
+            network_type=isochrone_generator.network_type,
+            travel_speed=isochrone_generator.travel_speed,
+            max_distance=isochrone_generator.max_distance,
+            save_path=country_path,
+            save_folder=save_folder,
+            save_format="csv",
+            save_to_s3=True
+        )
+        
+        return (facility_id, True, None)
+        
+    except Exception as e:
+        error_msg = f"Error processing facility {facility_data.get('id', 'unknown')}: {e}"
+        print(error_msg)
+        return (facility_data.get('id', 'unknown'), False, str(e))
+
+
+def process_facility_batch(facility_batch, isochrone_generator, country_path, save_folder):
+    """
+    Process a batch of facilities using ProcessPoolExecutor.
+    
+    Args:
+        facility_batch: List of facility dictionaries
+        isochrone_generator: Isochrone generator instance
+        country_path: Path to country directory
+        save_folder: Folder for saving isochrones
+    
+    Returns:
+        list: List of results from processing
+    """
+    results = []
+    
+    for facility_data in facility_batch:
+        try:
+            facility_coords = (facility_data['latitude'], facility_data['longitude'])
+            facility_id = facility_data['id']
+            tier_name = facility_data['tier_name']
+            
+            print(f"Processing facility {facility_id} ({tier_name}): {facility_coords}")
+            
+            # Generate isochrones
+            result = get_isochrone_polygons_for_facility(
+                facility_coords=facility_coords,
+                tier_name=tier_name,
+                facility_id=facility_id,
+                trip_times=isochrone_generator.ranges,
+                network_type=isochrone_generator.network_type,
+                travel_speed=isochrone_generator.travel_speed,
+                max_distance=isochrone_generator.max_distance,
+                save_path=country_path,
+                save_folder=save_folder,
+                save_format="csv",
+                save_to_s3=True
+            )
+            
+            results.append((facility_id, True, None))
+            
+        except Exception as e:
+            error_msg = f"Error processing facility {facility_data.get('id', 'unknown')}: {e}"
+            print(error_msg)
+            results.append((facility_data.get('id', 'unknown'), False, str(e)))
+    
+    return results
+
+
+def generate_isochrones_parallel_dask(
+    iso_code: str, 
+    transport_mode: str = "driving", 
+    tier_filter: str = "Tier4 central hospital",
+    n_workers: int = 4,
+    use_dask_distributed: bool = True
+):
+    """
+    Main function to generate isochrones for all facilities in a country using Dask parallelization.
     
     Args:
         iso_code: Country ISO code
         transport_mode: Transportation mode ('walking' or 'driving')
         tier_filter: Health facility tier to filter for
+        n_workers: Number of workers for parallel processing
+        use_dask_distributed: Whether to use Dask distributed client
     """
     
     # Validate inputs
@@ -289,14 +393,184 @@ def generate_isochrones(iso_code: str, transport_mode: str = "driving", tier_fil
     country_path = f"./{country_name.lower().replace(' ', '_')}"
     os.makedirs(country_path, exist_ok=True)
     
-    # Save facility data locally
-    # facility_df.to_csv(f"{country_path}/{iso_code.lower()}_facility_df.csv", index=False)
-    # print(facility_df.head())
+    # Filter facilities by specified tier
+    filtered_facilities = facility_df[facility_df["tier_name"] == tier_filter]
+    print(f"Found {len(filtered_facilities)} {tier_filter} facilities")
     
-    # Load population data
-    # population_df = pd.read_sql(f"SELECT building_id, longitude, latitude, population_sum FROM {schema}.population", engine)
-    # print("Population data shape:", population_df.shape)
-    # print(population_df.head())
+    if len(filtered_facilities) == 0:
+        print("No facilities found for the specified tier. Exiting.")
+        return
+    
+    # Create tier-specific save folder name (clean up tier name for folder)
+    tier_folder_name = tier_filter.lower().replace(' ', '_')
+    save_folder = f"facility_isochrones/{tier_folder_name}"
+    
+    # Create appropriate isochrone generator based on transport mode
+    if transport_mode.lower() == "walking":
+        isochrone_generator = WalkingDistanceIsochroneGenerator(ranges=[15, 30, 45, 60])
+        print(f"Using walking isochrone generator with ranges: [15, 30, 45, 60] minutes")
+    else:  # driving
+        isochrone_generator = DrivingDistanceIsochroneGenerator(ranges=[30, 60, 90, 120])
+        print(f"Using driving isochrone generator with ranges: [30, 60, 90, 120] minutes")
+    
+    # Convert facilities to list of dictionaries for parallel processing
+    facilities_list = filtered_facilities.to_dict('records')
+    
+    print(f"Starting parallel processing with {n_workers} workers...")
+    start_time = time.time()
+    
+    if use_dask_distributed:
+        # Option 1: Use Dask Distributed Client
+        try:
+            client = Client(n_workers=n_workers, threads_per_worker=1, processes=True)
+            print(f"Dask client dashboard: {client.dashboard_link}")
+            
+            # Create delayed tasks for each facility
+            delayed_tasks = [
+                process_single_facility(
+                    facility_data, 
+                    isochrone_generator, 
+                    country_path, 
+                    save_folder
+                ) 
+                for facility_data in facilities_list
+            ]
+            
+            # Compute all tasks in parallel
+            print(f"Computing {len(delayed_tasks)} tasks...")
+            results = dask.compute(*delayed_tasks)
+            
+            # Process results
+            successful = sum(1 for result in results if result[1])
+            failed = len(results) - successful
+            
+            print(f"\nParallel processing completed!")
+            print(f"Successful: {successful}")
+            print(f"Failed: {failed}")
+            
+            # Print failed facility IDs and errors
+            if failed > 0:
+                print("\nFailed facilities:")
+                for result in results:
+                    if not result[1]:
+                        print(f"  Facility {result[0]}: {result[2]}")
+            
+            client.close()
+            
+        except Exception as e:
+            print(f"Error with Dask distributed client: {e}")
+            print("Falling back to simple delayed execution...")
+            
+            # Fallback to simple delayed execution
+            delayed_tasks = [
+                process_single_facility(
+                    facility_data, 
+                    isochrone_generator, 
+                    country_path, 
+                    save_folder
+                ) 
+                for facility_data in facilities_list
+            ]
+            
+            results = dask.compute(*delayed_tasks, scheduler='threads', num_workers=n_workers)
+            
+            successful = sum(1 for result in results if result[1])
+            failed = len(results) - successful
+            
+            print(f"\nParallel processing completed!")
+            print(f"Successful: {successful}")
+            print(f"Failed: {failed}")
+    
+    else:
+        # Option 2: Use ProcessPoolExecutor with batching
+        batch_size = max(1, len(facilities_list) // n_workers)
+        facility_batches = [
+            facilities_list[i:i + batch_size] 
+            for i in range(0, len(facilities_list), batch_size)
+        ]
+        
+        print(f"Processing {len(facility_batches)} batches with batch size {batch_size}")
+        
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            # Submit batch processing tasks
+            future_to_batch = {
+                executor.submit(
+                    process_facility_batch, 
+                    batch, 
+                    isochrone_generator, 
+                    country_path, 
+                    save_folder
+                ): i for i, batch in enumerate(facility_batches)
+            }
+            
+            all_results = []
+            completed_batches = 0
+            
+            # Process completed futures as they finish
+            for future in futures_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    batch_results = future.result()
+                    all_results.extend(batch_results)
+                    completed_batches += 1
+                    print(f"Completed batch {completed_batches}/{len(facility_batches)}")
+                except Exception as exc:
+                    print(f"Batch {batch_idx} generated an exception: {exc}")
+            
+            # Process results
+            successful = sum(1 for result in all_results if result[1])
+            failed = len(all_results) - successful
+            
+            print(f"\nParallel processing completed!")
+            print(f"Successful: {successful}")
+            print(f"Failed: {failed}")
+            
+            # Print failed facility IDs and errors
+            if failed > 0:
+                print("\nFailed facilities:")
+                for result in all_results:
+                    if not result[1]:
+                        print(f"  Facility {result[0]}: {result[2]}")
+    
+    end_time = time.time()
+    processing_time = end_time - start_time
+    
+    print(f"\nTotal processing time: {processing_time:.2f} seconds")
+    print(f"Average time per facility: {processing_time / len(facilities_list):.2f} seconds")
+    print(f"Completed {transport_mode} isochrone generation for {tier_filter} facilities in {country_name} ({iso_code})")
+
+
+def generate_isochrones(iso_code: str, transport_mode: str = "driving", tier_filter: str = "Tier4 central hospital"):
+    """
+    Original sequential function to generate isochrones for all facilities in a country.
+    Kept for backward compatibility.
+    """
+    
+    # Validate inputs
+    assert transport_mode.lower() in ['walking', 'driving'], "transport_mode must be 'walking' or 'driving'"
+    assert tier_filter in ['Tier1 health post', 'Tier2 health center', 
+                          'Tier3 provincial hospital', 'Tier4 central hospital'], \
+                          f"Invalid tier_filter: {tier_filter}"
+    
+    # Get country name from ISO code
+    try:
+        country_name = get_country_name_from_iso(iso_code)
+        print(f"Processing isochrones for {country_name} ({iso_code.upper()})")
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
+    
+    # Set up database connection and load data
+    engine = connect_to_aws_db(SECRET_NAME, REGION_NAME)
+    
+    # Load facility data
+    schema = iso_code.lower()
+    query = f"SELECT * FROM {schema}.location"
+    facility_df = pd.read_sql(query, engine)
+    
+    # Create country-specific directory structure
+    country_path = f"./{country_name.lower().replace(' ', '_')}"
+    os.makedirs(country_path, exist_ok=True)
     
     # Filter facilities by specified tier
     filtered_facilities = facility_df[facility_df["tier_name"] == tier_filter]
@@ -335,7 +609,7 @@ def generate_isochrones(iso_code: str, transport_mode: str = "driving", tier_fil
                 save_path=country_path,
                 save_folder=save_folder,
                 save_format="csv",
-                save_to_s3=True
+                save_to_s3=False
             )
             
         except Exception as e:
@@ -347,34 +621,27 @@ def generate_isochrones(iso_code: str, transport_mode: str = "driving", tier_fil
 
 # Example usage
 if __name__ == "__main__":
-    # Example 1: Generate driving isochrones for Tier 4 facilities
-    generate_isochrones(
+    # Example 1: Generate driving isochrones for Tier 4 facilities using parallel processing
+    generate_isochrones_parallel_dask(
         iso_code="BWA", 
         transport_mode="driving", 
-        tier_filter="Tier4 central hospital"
+        tier_filter="Tier4 central hospital",
+        n_workers=4,
+        use_dask_distributed=True
     )
     
-    # Example 2: Generate walking isochrones for Tier 1 facilities
-    # generate_isochrones(
+    # Example 2: Generate walking isochrones for Tier 1 facilities with more workers
+    # generate_isochrones_parallel_dask(
     #     iso_code="UGA", 
     #     transport_mode="walking", 
-    #     tier_filter="Tier1 health post"
+    #     tier_filter="Tier1 health post",
+    #     n_workers=8,
+    #     use_dask_distributed=False  # Use ProcessPoolExecutor instead
     # )
     
-    # Example 3: Test single facility with specific parameters
-    # country_name = get_country_name_from_iso("BWA")  # Gets "Botswana"
-    # country_path = f"./{country_name.lower().replace(' ', '_')}"
-    # tier_folder = "facility_isochrones/tier4_central_hospital"
-    # 
-    # get_isochrone_polygons_for_facility(
-    #     facility_coords=(-24.5678, 25.1234),  # latitude, longitude
-    #     tier_name="Tier4 central hospital",
-    #     facility_id=2827,
-    #     trip_times=[30, 60, 90, 120],
-    #     network_type="drive",
-    #     travel_speed=30,
-    #     max_distance=60,
-    #     save_path=country_path,
-    #     save_folder=tier_folder,
-    #     save_to_s3=True
+    # Example 3: Use original sequential processing (for comparison or fallback)
+    # generate_isochrones(
+    #     iso_code="BWA", 
+    #     transport_mode="driving", 
+    #     tier_filter="Tier4 central hospital"
     # )
